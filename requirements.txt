@@ -4,4 +4,4 @@ openpyxl
 SpeechRecognition
 streamlit-mic-recorder
 edge-tts
-google-generativeai
+groq

@@ -7,7 +7,7 @@ import asyncio
 import os
 import random
 import pandas as pd
-import google.generativeai as genai
+from groq import Groq # 👈 改用 Groq
 import re
 
 # --- 設定區 ---
@@ -20,8 +20,6 @@ def load_custom_css():
     <style>
         #MainMenu {visibility: hidden;}
         footer {visibility: hidden;}
-        
-        /* 題目卡片 */
         .question-card {
             background-color: #f0f2f6;
             border-left: 5px solid #ff4b4b;
@@ -35,8 +33,6 @@ def load_custom_css():
             font-weight: bold;
             color: #1f1f1f;
         }
-        
-        /* 你的回答區塊 */
         .user-answer-box {
             background-color: #e8f4f9;
             border: 1px solid #d1e7ef;
@@ -46,10 +42,8 @@ def load_custom_css():
             font-style: italic;
             margin-bottom: 20px;
         }
-        
-        /* 讓按鈕區塊更好看 */
         .stButton button {
-            height: 44px; /* 強制設定高度以匹配錄音按鈕 */
+            height: 44px;
         }
     </style>
     """, unsafe_allow_html=True)
@@ -75,41 +69,56 @@ def transcribe_audio(audio_bytes):
     except:
         return None
 
+# 👇 [重點修改] 這裡改成呼叫 Groq API
 def get_ai_feedback(api_key, question, user_text):
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel('gemini-1.5-flash')
-
-    prompt = f"""
-    Act as a strict IELTS speaking examiner.
-    Topic: "{question}"
-    User Answer: "{user_text}"
-    
-    Step 1: Evaluate based on 4 criteria (0-100).
-    Step 2: Provide feedback.
-
-    Please output the response in this exact format:
-    
-    [SCORES]
-    Fluency: <score>
-    Vocabulary: <score>
-    Grammar: <score>
-    Pronunciation: <score>
-    [/SCORES]
-
-    ### 📝 Detailed Feedback
-    (Provide bullet points for each criteria here)
-
-    ### 💡 Better Expression
-    (One perfect native sentence)
-
-    ### 🔧 Advice (Traditional Chinese)
-    (One key tip)
-    """
     try:
-        response = model.generate_content(prompt)
-        return response.text
+        client = Groq(api_key=api_key)
+        
+        # System Prompt: 設定 AI 的角色
+        system_prompt = """
+        Act as a strict IELTS speaking examiner.
+        Evaluate the user's answer based on 4 criteria (0-100).
+        Provide feedback in the exact requested format.
+        """
+
+        # User Prompt: 傳入題目與回答
+        user_prompt = f"""
+        Topic: "{question}"
+        User Answer: "{user_text}"
+        
+        Please output the response in this exact format:
+        
+        [SCORES]
+        Fluency: <score>
+        Vocabulary: <score>
+        Grammar: <score>
+        Pronunciation: <score>
+        [/SCORES]
+
+        ### 📝 Detailed Feedback
+        (Provide bullet points for each criteria here)
+
+        ### 💡 Better Expression
+        (One perfect native sentence)
+
+        ### 🔧 Advice (Traditional Chinese)
+        (One key tip)
+        """
+
+        completion = client.chat.completions.create(
+            model="llama-3.3-70b-versatile", # 👈 使用 Groq 上強大的 Llama 3.3 模型
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            temperature=0.3, # 降低隨機性，讓格式更穩定
+            max_tokens=1024
+        )
+        
+        return completion.choices[0].message.content
+
     except Exception as e:
-        return f"Error: {e}"
+        return f"⚠️ Groq API Error: {e}"
 
 def parse_scores(text):
     scores = {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Pronunciation": 0}
@@ -134,14 +143,15 @@ def play_tts(text):
 
 # --- 頁面主程式 ---
 
-st.set_page_config(page_title="Speaking Pro", page_icon="🎙️", layout="centered")
+st.set_page_config(page_title="Speaking Pro (Groq)", page_icon="⚡", layout="centered")
 load_custom_css()
 
 # Sidebar
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/4712/4712009.png", width=80)
     st.title("Settings")
-    api_key_input = st.text_input("🔑 Google API Key", value=DEFAULT_API_KEY, type="password")
+    # 提示使用者輸入 Groq Key
+    api_key_input = st.text_input("🔑 Groq API Key", value=DEFAULT_API_KEY, type="password", help="Get it from console.groq.com")
     
     st.divider()
     if st.button("📂 Reload Excel Question"):
@@ -160,8 +170,8 @@ if "feedback" not in st.session_state:
 
 # --- UI 佈局 ---
 
-st.title("🎙️ AI Speaking Coach")
-st.markdown("Practice your English with real-time AI feedback.")
+st.title("⚡ AI Speaking Coach")
+st.markdown("Powered by **Groq Llama-3** for ultra-fast feedback.")
 
 # 1. 題目卡片
 st.markdown(f"""
@@ -171,12 +181,10 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 2. 操作按鈕區 [關鍵修改處]
-# vertical_alignment="center" 能確保兩個元件在同一水平線上
+# 2. 操作按鈕區
 col1, col2, col3 = st.columns([1, 2, 1], vertical_alignment="center")
 
 with col1:
-    # use_container_width=True 讓按鈕填滿寬度，視覺上更平衡
     if st.button("🎲 Skip Topic", use_container_width=True):
         st.session_state.current_question = random.choice(st.session_state.questions_list)
         st.session_state.transcript = ""
@@ -184,15 +192,15 @@ with col1:
         st.rerun()
 
 with col2:
-    # 這裡移除了 st.write(" ")，讓系統自動置中
-    audio_blob = mic_recorder(start_prompt="🔴 Record Answer", stop_prompt="⏹️ Stop & Submit", key='recorder')
+    # 這裡保留了 format="wav" 的修正，確保錄音正常
+    audio_blob = mic_recorder(start_prompt="🔴 Record", stop_prompt="⏹️ Stop", key='recorder', format="wav")
 
 with col3:
     pass
 
 # 3. 處理與顯示
 if audio_blob:
-    with st.spinner("🎧 Transcribing & Analyzing..."):
+    with st.spinner("⚡ Thinking at light speed..."): # 改了提示文字，強調 Groq 的速度
         transcript = transcribe_audio(audio_blob['bytes'])
         if transcript:
             st.session_state.transcript = transcript
@@ -200,9 +208,9 @@ if audio_blob:
                 feedback = get_ai_feedback(api_key_input, st.session_state.current_question, transcript)
                 st.session_state.feedback = feedback
             else:
-                st.error("Please enter API Key")
+                st.error("Please enter Groq API Key")
         else:
-            st.warning("No speech detected.")
+            st.warning("No speech detected. (Try speaking louder)")
 
 # 4. 結果展示
 if st.session_state.transcript:
@@ -231,14 +239,16 @@ if st.session_state.feedback:
     
     raw_text = st.session_state.feedback
     
+    # 簡單的解析容錯
     try:
         detailed_part = raw_text.split("### 📝 Detailed Feedback")[1].split("### 💡 Better Expression")[0]
         better_part = raw_text.split("### 💡 Better Expression")[1].split("### 🔧 Advice")[0]
         advice_part = raw_text.split("### 🔧 Advice (Traditional Chinese)")[1]
     except:
+        # 如果 Llama 輸出的格式稍微跑掉，就直接顯示原始全文，避免報錯
         detailed_part = raw_text
-        better_part = "Parsing error"
-        advice_part = "Parsing error"
+        better_part = "Content format parsing failed, please check detailed feedback tab."
+        advice_part = "Please check detailed feedback tab."
 
     with tab1:
         st.markdown(detailed_part)
@@ -246,8 +256,10 @@ if st.session_state.feedback:
     with tab2:
         st.success(better_part)
         clean_better = better_part.replace("*", "").strip()
-        if st.button("🔊 Listen to Native Version"):
-            play_tts(clean_better)
+        # 避免 TTS 讀到奇怪的錯誤訊息
+        if len(clean_better) > 5 and "Parsing error" not in clean_better:
+            if st.button("🔊 Listen to Native Version"):
+                play_tts(clean_better)
             
     with tab3:
         st.info(advice_part)
