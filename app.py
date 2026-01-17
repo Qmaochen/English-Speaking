@@ -11,8 +11,6 @@ import re
 from streamlit_gsheets import GSheetsConnection
 
 # --- ⚙️ 設定區 ---
-SHEET_NAME = "Sheet1" 
-
 if "GROQ_API_KEY" in st.secrets:
     DEFAULT_API_KEY = st.secrets["GROQ_API_KEY"]
 else:
@@ -59,7 +57,10 @@ def get_db_connection():
 def load_data():
     conn = get_db_connection()
     try:
-        df = conn.read(worksheet=SHEET_NAME, ttl=0)
+        # 🚨 關鍵修改：移除 worksheet=... 參數
+        # 這樣程式就會無腦讀取「第一頁」，不管它叫 Questions 還是 Sheet1 都會成功
+        df = conn.read(ttl=0)
+        
         expected_cols = ["Question", "Weak_Question", "Fluency", "Vocabulary", "Grammar", "Clarity"]
         if df.empty:
             df = pd.DataFrame(columns=expected_cols)
@@ -75,7 +76,8 @@ def load_data():
 def update_question_data(question, scores):
     conn = get_db_connection()
     try:
-        df = conn.read(worksheet=SHEET_NAME, ttl=0)
+        # 🚨 關鍵修改：移除 worksheet=...，預設抓第一頁
+        df = conn.read(ttl=0)
         df["Question"] = df["Question"].astype(str)
         
         avg_score = sum(scores.values()) / 4
@@ -101,7 +103,9 @@ def update_question_data(question, scores):
             }])
             df = pd.concat([df, new_row], ignore_index=True)
         
-        conn.update(worksheet=SHEET_NAME, data=df)
+        # 🚨 關鍵修改：這裡也不指定 worksheet，預設寫入第一頁
+        conn.update(data=df)
+        
         msg = "Saved! " + ("(Marked as Weak 🚩)" if is_weak == "Yes" else "(Good Job! ✅)")
         st.toast(msg, icon="💾")
         
@@ -131,7 +135,6 @@ def get_ai_feedback(api_key, question, user_text):
         
         IF RELEVANT:
         Evaluate normally based on IELTS speaking criteria.
-        Noted that IELTS is a informal speaking test, so minor grammar slips are acceptable.
         """
         
         user_prompt = f"""
@@ -184,9 +187,8 @@ async def generate_audio_bytes(text):
     await communicate.save(temp)
     with open(temp, "rb") as f: return f.read()
 
-# --- 🔄 按鈕回調函式 (重點) ---
+# --- 🔄 按鈕回調函式 ---
 
-# 重置錄音機的 Key，強制 UI 重新載入錄音元件
 def reset_mic():
     st.session_state.mic_key = st.session_state.get("mic_key", 0) + 1
 
@@ -197,15 +199,14 @@ def next_question_callback():
         st.session_state.feedback = ""
         st.session_state.tts_audio_bytes = None
         st.session_state.scratchpad = ""
-        reset_mic() # 換題時也要重置錄音機
+        reset_mic() 
 
 def retry_question_callback():
-    """只清除結果，保留原本題目"""
+    """只清除結果，保留題目"""
     st.session_state.transcript = ""
     st.session_state.feedback = ""
     st.session_state.tts_audio_bytes = None
-    # 不清除 scratchpad (可能想保留筆記)
-    reset_mic() # 關鍵：重置錄音機，這樣舊的音檔才不會殘留
+    reset_mic() 
 
 # --- 主程式 ---
 
@@ -219,7 +220,7 @@ if "transcript" not in st.session_state: st.session_state.transcript = ""
 if "feedback" not in st.session_state: st.session_state.feedback = ""
 if "tts_audio_bytes" not in st.session_state: st.session_state.tts_audio_bytes = None
 if "old_scores" not in st.session_state: st.session_state.old_scores = None
-if "mic_key" not in st.session_state: st.session_state.mic_key = 0 # 錄音機的唯一 ID
+if "mic_key" not in st.session_state: st.session_state.mic_key = 0 
 
 with st.sidebar:
     st.title("Settings")
@@ -237,7 +238,7 @@ with st.sidebar:
                 next_question_callback()
                 st.rerun()
             else:
-                st.error(f"Sheet '{SHEET_NAME}' is empty.")
+                st.error("Sheet is empty.")
                 
     with col2:
         if st.button("☁️ Weak Only"):
@@ -274,19 +275,16 @@ st.text_area("Scratchpad", height=68, key="scratchpad", label_visibility="collap
 c1, c2, c3 = st.columns([1, 1, 2], vertical_alignment="center")
 
 with c1: 
-    # 🔄 Retry 按鈕：清空結果，保留題目
     st.button("🔄 Retry", use_container_width=True, on_click=retry_question_callback)
     
 with c2: 
-    # ➡ Next 按鈕：換新題目
     st.button("➡ Next", type="primary", use_container_width=True, on_click=next_question_callback)
     
 with c3: 
-    # 錄音按鈕 (注意 key 是變動的，確保重置)
     audio_blob = mic_recorder(
         start_prompt="🔴 Record", 
         stop_prompt="⏹️ Stop", 
-        key=f'recorder_{st.session_state.mic_key}', # 每次重置 key 就會變，強制重新載入
+        key=f'recorder_{st.session_state.mic_key}', 
         format="wav"
     )
 
@@ -299,7 +297,6 @@ if audio_blob:
             if transcript:
                 st.session_state.transcript = transcript
                 if api_key_input:
-                    # 抓取舊分數 (會抓到您剛剛才存進去的那個分數)
                     try:
                         current_q = st.session_state.current_question
                         row = df[df["Question"] == current_q]
@@ -313,17 +310,14 @@ if audio_blob:
                         else: st.session_state.old_scores = None
                     except: st.session_state.old_scores = None
 
-                    # AI 分析
                     feedback = get_ai_feedback(api_key_input, st.session_state.current_question, transcript)
                     st.session_state.feedback = feedback
                     
                     parsed = parse_feedback_robust(feedback)
                     scores = parsed["scores"]
                     
-                    # 存入資料庫 (覆蓋舊分數)
                     update_question_data(st.session_state.current_question, scores)
                     
-                    # TTS
                     clean_better = parsed["better_expression"].replace("*", "").strip()
                     if len(clean_better) > 5:
                         st.session_state.tts_audio_bytes = asyncio.run(generate_audio_bytes(clean_better))
@@ -348,7 +342,6 @@ if st.session_state.feedback:
         st.error("⚠️ **Off-topic Warning**: Your answer seems unrelated to the topic.")
     
     m1, m2, m3, m4 = st.columns(4)
-    # 這裡的 old 就會是您上一輪的分數，所以可以看到進步幅度 (綠色數字)
     d_fl = scores["Fluency"] - old["Fluency"] if old else None
     d_vo = scores["Vocabulary"] - old["Vocabulary"] if old else None
     d_gr = scores["Grammar"] - old["Grammar"] if old else None
