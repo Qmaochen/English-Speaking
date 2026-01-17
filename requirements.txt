@@ -5,3 +5,4 @@ SpeechRecognition
 streamlit-mic-recorder
 edge-tts
 groq
+streamlit-gsheets

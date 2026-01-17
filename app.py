@@ -4,19 +4,16 @@ from streamlit_mic_recorder import mic_recorder
 from io import BytesIO
 import edge_tts
 import asyncio
-import os
 import random
 import pandas as pd
 from groq import Groq
 import re
-import json
 from datetime import datetime
+from streamlit_gsheets import GSheetsConnection
 
 # --- 設定區 ---
+# 記得把 API Key 設為空字串，強迫使用者輸入，或設為 st.secrets["GROQ_API_KEY"]
 DEFAULT_API_KEY = "" 
-EXCEL_FILE = "Questions.xlsx"
-WEAK_FILE = "Weak_Questions.csv"
-HISTORY_FILE = "score_history.json"
 
 # --- 💅 CSS 美化樣式 ---
 def load_custom_css():
@@ -49,79 +46,93 @@ def load_custom_css():
         .stButton button {
             height: 44px;
         }
-        /* 筆記區樣式 */
         .stTextArea textarea {
-            background-color: #fff9c4; /* 淡黃色像便條紙 */
+            background-color: #fff9c4;
             color: #333;
         }
     </style>
     """, unsafe_allow_html=True)
 
-# --- 核心功能函式 ---
+# --- ☁️ Google Sheets 核心功能 ---
 
-def load_questions(source="excel"):
-    file_path = EXCEL_FILE if source == "excel" else WEAK_FILE
+def get_db_connection():
+    """建立 Google Sheets 連線"""
+    return st.connection("gsheets", type=GSheetsConnection)
+
+def load_data(worksheet_name):
+    """從指定分頁讀取資料"""
+    conn = get_db_connection()
     try:
-        if source == "excel":
-            df = pd.read_excel(file_path)
-            col_name = 'Question'
-        else:
-            if not os.path.exists(file_path): return []
-            df = pd.read_csv(file_path)
-            col_name = 'Question'
-            
-        if col_name in df.columns:
-            return df[col_name].dropna().astype(str).tolist()
-        return []
-    except:
-        return []
+        # ttl=0 確保每次都讀到最新的，不使用快取
+        df = conn.read(worksheet=worksheet_name, ttl=0)
+        return df
+    except Exception as e:
+        st.error(f"Error loading {worksheet_name}: {e}")
+        return pd.DataFrame()
 
-def save_weak_question(question):
-    if not os.path.exists(WEAK_FILE):
-        df = pd.DataFrame({"Question": [question]})
-        df.to_csv(WEAK_FILE, index=False)
-    else:
-        df = pd.read_csv(WEAK_FILE)
-        if question not in df['Question'].values:
-            new_row = pd.DataFrame({"Question": [question]})
-            df = pd.concat([df, new_row], ignore_index=True)
-            df.to_csv(WEAK_FILE, index=False)
-
-def save_score_history(question, scores):
-    history = {}
-    if os.path.exists(HISTORY_FILE):
-        try:
-            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-                history = json.load(f)
-        except:
-            pass 
-    
-    if question not in history:
-        history[question] = []
-    
-    record = {
-        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
-        "scores": scores
-    }
-    history[question].append(record)
-    
-    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-        json.dump(history, f, ensure_ascii=False, indent=4)
-
-def get_previous_scores(question):
-    if not os.path.exists(HISTORY_FILE):
-        return None
+def save_weak_question_cloud(question):
+    """將錯題寫入雲端 Weak_Questions 分頁"""
+    conn = get_db_connection()
     try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            history = json.load(f)
+        df = conn.read(worksheet="Weak_Questions", ttl=0)
         
-        records = history.get(question, [])
-        if len(records) >= 2:
-            return records[-2]["scores"]
-        else:
+        # 檢查是否已存在
+        if "Question" in df.columns and question not in df["Question"].values:
+            new_row = pd.DataFrame({"Question": [question]})
+            updated_df = pd.concat([df, new_row], ignore_index=True)
+            conn.update(worksheet="Weak_Questions", data=updated_df)
+            st.toast("Saved to Cloud Weak Qs! ☁️", icon="💾")
+    except Exception as e:
+        st.error(f"Cloud Save Error: {e}")
+
+def save_score_history_cloud(question, scores):
+    """將分數寫入雲端 Score_History 分頁"""
+    conn = get_db_connection()
+    try:
+        df = conn.read(worksheet="Score_History", ttl=0)
+        
+        new_record = {
+            "Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "Question": question,
+            "Fluency": scores["Fluency"],
+            "Vocabulary": scores["Vocabulary"],
+            "Grammar": scores["Grammar"],
+            "Clarity": scores["Clarity"]
+        }
+        new_row = pd.DataFrame([new_record])
+        updated_df = pd.concat([df, new_row], ignore_index=True)
+        conn.update(worksheet="Score_History", data=updated_df)
+    except Exception as e:
+        st.error(f"History Save Error: {e}")
+
+def get_previous_scores_cloud(question):
+    """從雲端讀取上一次的分數"""
+    try:
+        conn = get_db_connection()
+        df = conn.read(worksheet="Score_History", ttl=0)
+        
+        if df.empty or "Question" not in df.columns:
             return None
+            
+        # 篩選該題目的歷史紀錄
+        history = df[df["Question"] == question]
+        
+        if len(history) >= 1:
+            # 取最後一筆 (iloc[-1] 是最新的，但我們要比較的對象是"這次存入之前的最新")
+            # 邏輯：因為我們剛剛已經存入了這次的分數，所以現在資料庫裡最新的一筆是"這次"，倒數第二筆是"上次"
+            if len(history) >= 2:
+                last_record = history.iloc[-2]
+                return {
+                    "Fluency": last_record["Fluency"],
+                    "Vocabulary": last_record["Vocabulary"],
+                    "Grammar": last_record["Grammar"],
+                    "Clarity": last_record["Clarity"]
+                }
+        return None
     except:
         return None
+
+# --- 其他輔助函式 ---
 
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
@@ -136,98 +147,75 @@ def transcribe_audio(audio_bytes):
 def get_ai_feedback(api_key, question, user_text):
     try:
         client = Groq(api_key=api_key)
-        
         system_prompt = """
         Act as a helpful, supportive English speaking tutor. 
         IMPORTANT: You cannot hear the audio. You can only see the transcript.
         Evaluate "Clarity" based on how coherent the transcript is.
-        
-        Your Goals:
-        1. Rate leniently. Focus on communication intelligibility.
-        2. In "Better Expression", DO NOT rewrite the whole paragraph. Just fix grammar and vocabulary.
-        3. In "Advice", provide a simple SENTENCE TEMPLATE (Pattern).
         """
-
         user_prompt = f"""
         Topic: "{question}"
         User Answer: "{user_text}"
         
         Please output the response in this exact format:
-        
         [SCORES]
         Fluency: <score 0-10>
         Vocabulary: <score 0-10>
         Grammar: <score 0-10>
         Clarity: <score 0-10>
         [/SCORES]
-
         ### 📝 Feedback
         (Give 2-3 brief, encouraging bullet points.)
-
         ### 💡 Better Expression
-        (Just fix grammar. Add punctuation.)
-
+        (Modify the user's sentence MINIMALLY. Just fix grammar. Add punctuation.)
         ### 🔧 Advice (Template)
-        (Provide a useful English sentence template/structure that the user can use to answer this question better next time.)
+        (Provide a useful English sentence template/structure.)
         """
-
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt}
-            ],
-            temperature=0.3,
-            max_tokens=1024
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+            temperature=0.3, max_tokens=1024
         )
-        
         return completion.choices[0].message.content
-
     except Exception as e:
         return f"⚠️ Groq API Error: {e}"
 
 def parse_feedback_robust(text):
-    result = {
-        "scores": {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Clarity": 0},
-        "feedback": "No feedback found.",
-        "better_expression": "No better expression found.",
-        "advice": "No advice found."
-    }
-    
+    result = {"scores": {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Clarity": 0}, "feedback": "", "better_expression": "", "advice": ""}
     try:
         pattern = r"(\w+):\s*(\d+(\.\d+)?)"
         matches = re.findall(pattern, text)
         for key, value, _ in matches:
-            if key in result["scores"]:
-                result["scores"][key] = float(value)
-    except:
-        pass
-
-    fb_match = re.search(r"### 📝 Feedback\s*(.*?)\s*###", text, re.DOTALL)
-    if fb_match: result["feedback"] = fb_match.group(1).strip()
+            if key in result["scores"]: result["scores"][key] = float(value)
+    except: pass
     
-    be_match = re.search(r"### 💡 Better Expression\s*(.*?)\s*###", text, re.DOTALL)
-    if be_match: result["better_expression"] = be_match.group(1).strip()
-        
-    ad_match = re.search(r"### 🔧 Advice.*?\)\s*(.*)", text, re.DOTALL)
-    if not ad_match:
-        ad_match = re.search(r"### 🔧 Advice\s*(.*)", text, re.DOTALL)
-    if ad_match: result["advice"] = ad_match.group(1).strip()
-
+    fb = re.search(r"### 📝 Feedback\s*(.*?)\s*###", text, re.DOTALL)
+    if fb: result["feedback"] = fb.group(1).strip()
+    be = re.search(r"### 💡 Better Expression\s*(.*?)\s*###", text, re.DOTALL)
+    if be: result["better_expression"] = be.group(1).strip()
+    ad = re.search(r"### 🔧 Advice.*?\)\s*(.*)", text, re.DOTALL)
+    if not ad: ad = re.search(r"### 🔧 Advice\s*(.*)", text, re.DOTALL)
+    if ad: result["advice"] = ad.group(1).strip()
     return result
 
-# [修改] 改為生成音訊檔案並讀取為 Bytes，不直接播放
 async def generate_audio_bytes(text):
     communicate = edge_tts.Communicate(text, "en-US-AndrewNeural")
     temp_filename = "temp_tts_output.mp3"
     await communicate.save(temp_filename)
-    with open(temp_filename, "rb") as f:
-        audio_bytes = f.read()
+    with open(temp_filename, "rb") as f: audio_bytes = f.read()
     return audio_bytes
+
+# Callback for Skip Topic
+def skip_topic_callback():
+    if st.session_state.questions_list:
+        st.session_state.current_question = random.choice(st.session_state.questions_list)
+        st.session_state.transcript = ""
+        st.session_state.feedback = ""
+        st.session_state.tts_audio_bytes = None
+        st.session_state.scratchpad = ""
 
 # --- 頁面主程式 ---
 
-st.set_page_config(page_title="Speaking Tutor Pro", page_icon="📈", layout="centered")
+st.set_page_config(page_title="Speaking Tutor Pro (Cloud)", page_icon="☁️", layout="centered")
 load_custom_css()
 
 # Sidebar
@@ -238,87 +226,73 @@ with st.sidebar:
     
     st.divider()
     
+    # Mode Selection (Directly loading from Cloud)
     col_s1, col_s2 = st.columns(2)
     with col_s1:
-        if st.button("📂 Normal"):
-            st.session_state.questions_list = load_questions("excel")
-            st.session_state.mode = "Normal"
-            st.rerun()
+        if st.button("☁️ Normal"):
+            with st.spinner("Loading from Cloud..."):
+                df = load_data("Questions")
+                if not df.empty:
+                    st.session_state.questions_list = df['Question'].dropna().astype(str).tolist()
+                    st.session_state.mode = "Normal"
+                    skip_topic_callback() # Load a new question
+                    st.rerun()
+                else:
+                    st.error("Failed to load 'Questions' tab.")
+                    
     with col_s2:
-        if st.button("❤️ Weak Qs"):
-            qs = load_questions("weak")
-            if not qs:
-                st.toast("No weak questions yet!", icon="⚠️")
-            else:
-                st.session_state.questions_list = qs
-                st.session_state.mode = "Weak Review"
-                st.rerun()
+        if st.button("☁️ Weak"):
+            with st.spinner("Loading Weak Qs..."):
+                df = load_data("Weak_Questions")
+                if not df.empty:
+                    st.session_state.questions_list = df['Question'].dropna().astype(str).tolist()
+                    st.session_state.mode = "Weak Review"
+                    skip_topic_callback()
+                    st.rerun()
+                else:
+                    st.warning("No weak questions found in cloud.")
 
-    st.caption(f"Current Mode: {st.session_state.get('mode', 'Normal')}")
-    
-    # [需求 1] 資料下載區
+    st.caption(f"Mode: {st.session_state.get('mode', 'Normal')}")
     st.divider()
-    st.write("💾 **Data Backup**")
-    if os.path.exists(WEAK_FILE):
-        with open(WEAK_FILE, "rb") as file:
-            st.download_button("📥 Weak Questions (.csv)", file, "Weak_Questions.csv", "text/csv")
-            
-    if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, "rb") as file:
-            st.download_button("📥 Score History (.json)", file, "score_history.json", "application/json")
+    st.info("Data is automatically saved to Google Sheets.")
 
-# 初始化 Session State
+# Initialization
 if "questions_list" not in st.session_state:
-    st.session_state.questions_list = load_questions("excel")
+    # Default fallback if not loaded yet
+    st.session_state.questions_list = ["Describe a happy memory."] 
 if "current_question" not in st.session_state:
-    st.session_state.current_question = random.choice(st.session_state.questions_list) if st.session_state.questions_list else "No Question"
-if "transcript" not in st.session_state:
-    st.session_state.transcript = ""
-if "feedback" not in st.session_state:
-    st.session_state.feedback = ""
-if "tts_audio_bytes" not in st.session_state:
-    st.session_state.tts_audio_bytes = None
+    st.session_state.current_question = "Press a mode button to start!"
+if "transcript" not in st.session_state: st.session_state.transcript = ""
+if "feedback" not in st.session_state: st.session_state.feedback = ""
+if "tts_audio_bytes" not in st.session_state: st.session_state.tts_audio_bytes = None
 
-# --- UI ---
+# UI Layout
+st.title("☁️ AI Speaking Tutor")
+st.markdown("Connected to **Google Sheets**. Practice anywhere, sync everywhere.")
 
-st.title("📈 AI Speaking Tutor")
-
-# 1. 題目
+# Question Card
 st.markdown(f"""
 <div class="question-card">
-    <div style="color: #666; font-size: 14px; margin-bottom: 5px;">CURRENT TOPIC ({st.session_state.get('mode', 'Normal')})</div>
+    <div style="color: #666; font-size: 14px; margin-bottom: 5px;">TOPIC ({st.session_state.get('mode', 'Wait')})</div>
     <div class="question-text">{st.session_state.current_question}</div>
 </div>
 """, unsafe_allow_html=True)
 
-# 2. [需求 2] 構思筆記區 (Scratchpad)
-st.caption("📝 Scratchpad (Type your keywords here, won't be graded)")
-st.text_area("Scratchpad", height=68, placeholder="Draft your ideas here...", key="scratchpad", label_visibility="collapsed")
+# Scratchpad
+st.caption("📝 Scratchpad")
+st.text_area("Scratchpad", height=68, key="scratchpad", label_visibility="collapsed")
 
-# 3. 按鈕與錄音
+# Buttons
 col1, col2, col3 = st.columns([1, 2, 1], vertical_alignment="center")
-
 with col1:
-    if st.button("🎲 Skip Topic", use_container_width=True):
-        if st.session_state.questions_list:
-            st.session_state.current_question = random.choice(st.session_state.questions_list)
-            st.session_state.transcript = ""
-            st.session_state.feedback = ""
-            st.session_state.tts_audio_bytes = None # 清空舊的音檔
-            st.session_state.scratchpad = "" # 清空筆記
-            st.rerun()
-
+    st.button("🎲 Skip", use_container_width=True, on_click=skip_topic_callback)
 with col2:
     audio_blob = mic_recorder(start_prompt="🔴 Record", stop_prompt="⏹️ Stop", key='recorder', format="wav")
 
-with col3:
-    pass
-
-# 4. 處理邏輯
+# Processing
 if audio_blob:
     st.audio(audio_blob['bytes'], format='audio/wav')
-    
-    with st.spinner("⚡ Tutor is analyzing..."):
+    with st.spinner("⚡ Cloud AI Analyzing..."):
         transcript = transcribe_audio(audio_blob['bytes'])
         if transcript:
             st.session_state.transcript = transcript
@@ -326,71 +300,58 @@ if audio_blob:
                 feedback = get_ai_feedback(api_key_input, st.session_state.current_question, transcript)
                 st.session_state.feedback = feedback
                 
-                # 解析並儲存
                 parsed = parse_feedback_robust(feedback)
-                save_score_history(st.session_state.current_question, parsed["scores"])
+                scores = parsed["scores"]
                 
-                # [需求 3] 預先生成音訊並存入 session_state
+                # 1. Save History to Cloud
+                save_score_history_cloud(st.session_state.current_question, scores)
+                
+                # 2. Check Weak Question & Save to Cloud
+                avg = sum(scores.values()) / 4
+                if avg < 6.0:
+                    save_weak_question_cloud(st.session_state.current_question)
+                
+                # 3. Generate TTS
                 clean_better = parsed["better_expression"].replace("*", "").strip()
                 if len(clean_better) > 5:
-                    audio_bytes = asyncio.run(generate_audio_bytes(clean_better))
-                    st.session_state.tts_audio_bytes = audio_bytes
+                    st.session_state.tts_audio_bytes = asyncio.run(generate_audio_bytes(clean_better))
                 else:
                     st.session_state.tts_audio_bytes = None
-                
             else:
-                st.error("Please enter Groq API Key")
+                st.error("Missing API Key")
         else:
             st.warning("No speech detected.")
 
-# 5. 結果展示
+# Results
 if st.session_state.transcript:
     st.divider()
-    st.markdown(f"""
-    <div class="user-answer-box">
-        <b>🗣️ You said:</b><br>
-        {st.session_state.transcript}
-    </div>
-    """, unsafe_allow_html=True)
+    st.markdown(f"""<div class="user-answer-box"><b>🗣️ You said:</b><br>{st.session_state.transcript}</div>""", unsafe_allow_html=True)
 
 if st.session_state.feedback:
     data = parse_feedback_robust(st.session_state.feedback)
     scores = data["scores"]
     
-    avg_score = sum(scores.values()) / 4 if scores else 0
-    if avg_score > 0 and avg_score < 6.0:
-        save_weak_question(st.session_state.current_question)
-        st.toast(f"Low score ({avg_score:.1f}). Saved to Weak Questions!", icon="💾")
-
-    prev_scores = get_previous_scores(st.session_state.current_question)
+    # Get previous scores from cloud for comparison
+    prev = get_previous_scores_cloud(st.session_state.current_question)
     
-    st.subheader("📊 Score & Progress")
-    if prev_scores:
-        st.caption("Comparing with your last attempt (Green = Improved)")
-
+    st.subheader("📊 Score & Cloud Sync")
+    if prev: st.caption("Comparing with Cloud History (Green = Improved)")
+    
     m1, m2, m3, m4 = st.columns(4)
-    d_fluency = scores["Fluency"] - prev_scores["Fluency"] if prev_scores else None
-    d_vocab = scores["Vocabulary"] - prev_scores["Vocabulary"] if prev_scores else None
-    d_grammar = scores["Grammar"] - prev_scores["Grammar"] if prev_scores else None
-    d_clarity = scores["Clarity"] - prev_scores["Clarity"] if prev_scores else None
-
-    m1.metric("Fluency", f"{scores['Fluency']}", delta=d_fluency, border=True)
-    m2.metric("Vocab", f"{scores['Vocabulary']}", delta=d_vocab, border=True)
-    m3.metric("Grammar", f"{scores['Grammar']}", delta=d_grammar, border=True)
-    m4.metric("Clarity", f"{scores['Clarity']}", delta=d_clarity, border=True)
-
-    st.markdown("---")
+    d_fl = scores["Fluency"] - prev["Fluency"] if prev else None
+    d_vo = scores["Vocabulary"] - prev["Vocabulary"] if prev else None
+    d_gr = scores["Grammar"] - prev["Grammar"] if prev else None
+    d_cl = scores["Clarity"] - prev["Clarity"] if prev else None
     
-    tab1, tab2, tab3 = st.tabs(["📝 Feedback", "💡 Better Expression", "🔧 Template"])
-
-    with tab1:
-        st.markdown(data["feedback"])
+    m1.metric("Fluency", f"{scores['Fluency']}", delta=d_fl, border=True)
+    m2.metric("Vocab", f"{scores['Vocabulary']}", delta=d_vo, border=True)
+    m3.metric("Grammar", f"{scores['Grammar']}", delta=d_gr, border=True)
+    m4.metric("Clarity", f"{scores['Clarity']}", delta=d_cl, border=True)
     
-    with tab2:
+    st.divider()
+    t1, t2, t3 = st.tabs(["📝 Feedback", "💡 Better Expression", "🔧 Template"])
+    with t1: st.markdown(data["feedback"])
+    with t2: 
         st.success(data["better_expression"])
-        # [需求 3] 直接顯示播放器，不需要再按按鈕生成
-        if st.session_state.tts_audio_bytes:
-            st.audio(st.session_state.tts_audio_bytes, format="audio/mp3")
-            
-    with tab3:
-        st.info(data["advice"])
+        if st.session_state.tts_audio_bytes: st.audio(st.session_state.tts_audio_bytes, format="audio/mp3")
+    with t3: st.info(data["advice"])
