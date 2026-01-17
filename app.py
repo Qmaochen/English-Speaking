@@ -103,11 +103,15 @@ def get_ai_feedback(api_key, question, user_text):
         Act as a helpful, supportive English speaking tutor. 
         The user is practicing for casual conversation or IELTS Speaking Part 1.
         
+        IMPORTANT: You cannot hear the audio. You can only see the transcript.
+        Therefore, instead of "Pronunciation", evaluate "Clarity". 
+        
+        If the transcript is perfectly coherent, give a high Clarity score (it means the speech-to-text engine understood the user well).
+        If the transcript has nonsense words or phonetic mix-ups (e.g., "sheep" instead of "ship"), lower the Clarity score.
+        
         Your Goals:
-        1. Rate leniently. Focus on communication intelligibility rather than perfection.
-        2. In "Better Expression", DO NOT rewrite the whole paragraph or change the meaning. 
-           Keep the user's original vocabulary level and sentence structure as much as possible.
-           Just fix grammar errors and make it flow slightly more naturally.
+        1. Rate leniently. Focus on communication intelligibility.
+        2. In "Better Expression", DO NOT rewrite the whole paragraph. Keep the user's style. Just fix grammar.
         """
 
         # [修改 2] User Prompt: 調整指令
@@ -121,11 +125,11 @@ def get_ai_feedback(api_key, question, user_text):
         Fluency: <score 0-10>
         Vocabulary: <score 0-10>
         Grammar: <score 0-10>
-        Pronunciation: <score 0-10>
+        Clarity: <score 0-10>
         [/SCORES]
 
         ### 📝 Feedback
-        (Give 2-3 brief, encouraging bullet points on what was good and what to fix)
+        (Give 2-3 brief, encouraging bullet points. If text looks wrong, ask if they meant a different word.)
 
         ### 💡 Better Expression
         (Modify the user's sentence MINIMALLY. Just fix grammar/prepositions. Add punctuation.)
@@ -150,7 +154,7 @@ def get_ai_feedback(api_key, question, user_text):
         return f"⚠️ Groq API Error: {e}"
 
 def parse_scores(text):
-    scores = {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Pronunciation": 0}
+    scores = {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Clarity": 0}
     try:
         pattern = r"(\w+):\s*(\d+(\.\d+)?)" # 支援小數點
         matches = re.findall(pattern, text)
@@ -286,7 +290,7 @@ if st.session_state.feedback:
     m1.metric("Fluency", f"{scores.get('Fluency', '-')}", border=True)
     m2.metric("Vocab", f"{scores.get('Vocabulary', '-')}", border=True)
     m3.metric("Grammar", f"{scores.get('Grammar', '-')}", border=True)
-    m4.metric("Pronun.", f"{scores.get('Pronunciation', '-')}", border=True)
+    m4.metric("Clarity", f"{scores.get('Clarity', '-')}", border=True)
 
     st.markdown("---")
     
