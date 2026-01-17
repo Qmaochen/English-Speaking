@@ -125,25 +125,33 @@ def get_ai_feedback(api_key, question, user_text):
         
         # 2. 修改 Prompt，加入長度檢查規則
         system_prompt = f"""
-        Act as a helpful IELTS examiner.
-        Noted that IELTS is an informal speaking test, so casual expressions are allowed.
+        Act as a supportive IELTS speaking tutor.
         
-        Evaluation Steps:
-        1. CHECK RELEVANCE: Is the answer on topic? 
-           - If No: Score should be deducted.
+        IMPORTANT CONTEXT:
+        The user input is generated via Speech-to-Text. 
+        **IT MAY CONTAIN TRANSCRIPTION ERRORS.** (e.g., "whole" vs "hole", "sea" vs "see").
+        
+        Evaluation Rules:
+        1. **RELEVANCE (Be Lenient):** - If the answer seems slightly off, assume it's a transcription error. 
+           - Try to interpret the user's intent favorably. 
+           - ONLY mark as "Off-topic" if the answer is completely random gibberish or discusses a totally different subject (e.g., talking about 'mathematics' when asked about 'favorite food').
            
-        2. CHECK LENGTH (Target: ~1 minute speaking, approx 100+ words):
-           - Current Word Count: {word_count} words.
-           - If < 50 words (Extremely Short): Max Score 5.0. Feedback: "⚠️ Too short (Under 20s). Please expand."
-           - If < 100 words (Short): Deduct 1.0-2.0 from Fluency. Feedback: "⚠️ A bit short. Elaborate more."
+        2. **SCORING:**
+           - Even if slightly off-topic, evaluate the English proficiency (Grammar, Vocabulary, Fluency) anyway.
+           - Do NOT set scores to 0 unless the input is empty or incomprehensible noise.
+        
+        3. **LENGTH CHECK (Target: ~100+ words):**
+           - Current Count: {word_count} words.
+           - If < 40 words: Max Score 5.5 (Unless very high quality). Suggest expanding.
+           - If 40-70 words: Max Score 7.0. Suggest adding more details.
            
-        3. CHECK QUALITY: Evaluate Fluency, Vocabulary, Grammar, Clarity.
+        4. **OUTPUT FORMAT:**
+           - STRICTLY follow the requested format below.
         """
         
         user_prompt = f"""
-        Topic: "{question}"
-        User Answer: "{user_text}"
-        Word Count: {word_count}
+        Question: "{question}"
+        User Answer (Raw Transcript): "{user_text}"
         
         Output exact format:
         [SCORES]
@@ -153,11 +161,11 @@ def get_ai_feedback(api_key, question, user_text):
         Clarity: <0-10>
         [/SCORES]
         ### 📝 Feedback
-        (Bullet points. Mention length issue if any.)
+        (Bullet points. Be encouraging. If the transcript looks wrong, ask "Did you mean...?")
         ### 💡 Better Expression
-        (Refined sentence)
+        (Refined sentence assuming the user's likely intent)
         ### 🔧 Advice
-        (Template)
+        (template for user to practice similar questions)
         """
         
         completion = client.chat.completions.create(
