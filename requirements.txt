@@ -1,6 +1,6 @@
 streamlit
-streamlit-gsheets
-speechrecognition
+st-gsheets-connection
+SpeechRecognition
 streamlit-mic-recorder
 edge-tts
 groq
