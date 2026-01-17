@@ -125,12 +125,12 @@ def get_ai_feedback(api_key, question, user_text):
         
         # 2. 修改 Prompt，加入長度檢查規則
         system_prompt = f"""
-        Act as a strict but helpful IELTS examiner.
+        Act as a helpful IELTS examiner.
         Noted that IELTS is an informal speaking test, so casual expressions are allowed.
         
         Evaluation Steps:
         1. CHECK RELEVANCE: Is the answer on topic? 
-           - If No: Score 0. Feedback: "⚠️ Off-topic".
+           - If No: Score should be deducted.
            
         2. CHECK LENGTH (Target: ~1 minute speaking, approx 100+ words):
            - Current Word Count: {word_count} words.
