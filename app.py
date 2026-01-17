@@ -44,7 +44,6 @@ def load_custom_css():
             margin-bottom: 20px;
         }
         .stButton button { height: 44px; }
-        /* Next 按鈕紅色，Retry 按鈕藍色 */
         div[data-testid="column"] button { width: 100%; }
     </style>
     """, unsafe_allow_html=True)
@@ -57,10 +56,8 @@ def get_db_connection():
 def load_data():
     conn = get_db_connection()
     try:
-        # 🚨 關鍵修改：移除 worksheet=... 參數
-        # 這樣程式就會無腦讀取「第一頁」，不管它叫 Questions 還是 Sheet1 都會成功
+        # 讀取第一頁
         df = conn.read(ttl=0)
-        
         expected_cols = ["Question", "Weak_Question", "Fluency", "Vocabulary", "Grammar", "Clarity"]
         if df.empty:
             df = pd.DataFrame(columns=expected_cols)
@@ -76,7 +73,6 @@ def load_data():
 def update_question_data(question, scores):
     conn = get_db_connection()
     try:
-        # 🚨 關鍵修改：移除 worksheet=...，預設抓第一頁
         df = conn.read(ttl=0)
         df["Question"] = df["Question"].astype(str)
         
@@ -103,16 +99,14 @@ def update_question_data(question, scores):
             }])
             df = pd.concat([df, new_row], ignore_index=True)
         
-        # 🚨 關鍵修改：這裡也不指定 worksheet，預設寫入第一頁
         conn.update(data=df)
-        
         msg = "Saved! " + ("(Marked as Weak 🚩)" if is_weak == "Yes" else "(Good Job! ✅)")
         st.toast(msg, icon="💾")
         
     except Exception as e:
         st.error(f"寫入錯誤: {e}")
 
-# --- 其他功能 ---
+# --- AI 分析核心 (重點修改區) ---
 
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
@@ -125,21 +119,31 @@ def transcribe_audio(audio_bytes):
 def get_ai_feedback(api_key, question, user_text):
     try:
         client = Groq(api_key=api_key)
-        system_prompt = """
-        Act as a strict but helpful English tutor.
-        First, CHECK RELEVANCE: Is the User Answer related to the Topic?
         
-        IF OFF-TOPIC:
-        Set all scores to 0. 
-        Start feedback with "⚠️ **OFF-TOPIC WARNING**".
+        # 1. 計算字數
+        word_count = len(user_text.split())
         
-        IF RELEVANT:
-        Evaluate normally based on IELTS speaking criteria.
+        # 2. 修改 Prompt，加入長度檢查規則
+        system_prompt = f"""
+        Act as a strict but helpful IELTS examiner.
+        Noted that IELTS is an informal speaking test, so casual expressions are allowed.
+        
+        Evaluation Steps:
+        1. CHECK RELEVANCE: Is the answer on topic? 
+           - If No: Score 0. Feedback: "⚠️ Off-topic".
+           
+        2. CHECK LENGTH (Target: ~1 minute speaking, approx 100+ words):
+           - Current Word Count: {word_count} words.
+           - If < 50 words (Extremely Short): Max Score 5.0. Feedback: "⚠️ Too short (Under 20s). Please expand."
+           - If < 100 words (Short): Deduct 1.0-2.0 from Fluency. Feedback: "⚠️ A bit short. Elaborate more."
+           
+        3. CHECK QUALITY: Evaluate Fluency, Vocabulary, Grammar, Clarity.
         """
         
         user_prompt = f"""
         Topic: "{question}"
         User Answer: "{user_text}"
+        Word Count: {word_count}
         
         Output exact format:
         [SCORES]
@@ -149,12 +153,13 @@ def get_ai_feedback(api_key, question, user_text):
         Clarity: <0-10>
         [/SCORES]
         ### 📝 Feedback
-        (Bullet points. If off-topic, explain why.)
+        (Bullet points. Mention length issue if any.)
         ### 💡 Better Expression
-        (Refined sentence from User Answer, with improvements marked with *asterisks*.)
+        (Refined sentence)
         ### 🔧 Advice
-        (Give a useful template sentence for this type of question.)
+        (Template)
         """
+        
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
@@ -202,7 +207,6 @@ def next_question_callback():
         reset_mic() 
 
 def retry_question_callback():
-    """只清除結果，保留題目"""
     st.session_state.transcript = ""
     st.session_state.feedback = ""
     st.session_state.tts_audio_bytes = None
@@ -271,7 +275,7 @@ st.markdown(f"""
 # Scratchpad
 st.text_area("Scratchpad", height=68, key="scratchpad", label_visibility="collapsed", placeholder="Write notes here...")
 
-# Buttons Layout (Retry / Next / Record)
+# Buttons Layout
 c1, c2, c3 = st.columns([1, 1, 2], vertical_alignment="center")
 
 with c1: 
@@ -329,7 +333,18 @@ if audio_blob:
 # Display Results
 if st.session_state.transcript:
     st.divider()
-    st.markdown(f"""<div class="user-answer-box"><b>🗣️ You said:</b><br>{st.session_state.transcript}</div>""", unsafe_allow_html=True)
+    
+    # 顯示字數，讓使用者有感覺
+    word_count = len(st.session_state.transcript.split())
+    st.markdown(f"""
+    <div class="user-answer-box">
+        <div style="display:flex; justify-content:space-between;">
+            <b>🗣️ You said:</b>
+            <span style="color: #666; font-size: 0.8em;">Word Count: {word_count}</span>
+        </div>
+        <br>{st.session_state.transcript}
+    </div>
+    """, unsafe_allow_html=True)
 
 if st.session_state.feedback:
     data = parse_feedback_robust(st.session_state.feedback)
@@ -338,8 +353,11 @@ if st.session_state.feedback:
     
     st.subheader("📊 Results")
     
-    if scores['Fluency'] == 0 and scores['Vocabulary'] == 0:
-        st.error("⚠️ **Off-topic Warning**: Your answer seems unrelated to the topic.")
+    # 檢查是否因為太短或離題而拿到低分
+    if scores['Fluency'] == 0:
+        st.error("⚠️ **Score 0**: Off-topic.")
+    elif scores['Fluency'] <= 5.0 and len(st.session_state.transcript.split()) < 30:
+        st.warning("⚠️ **Low Score**: Too Short! Try to speak for at least 1 minute.")
     
     m1, m2, m3, m4 = st.columns(4)
     d_fl = scores["Fluency"] - old["Fluency"] if old else None
