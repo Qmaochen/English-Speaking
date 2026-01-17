@@ -10,7 +10,9 @@ from groq import Groq
 import re
 from streamlit_gsheets import GSheetsConnection
 
-# --- 設定區 ---
+# --- ⚙️ 設定區 ---
+SHEET_NAME = "Sheet1" 
+
 if "GROQ_API_KEY" in st.secrets:
     DEFAULT_API_KEY = st.secrets["GROQ_API_KEY"]
 else:
@@ -44,49 +46,44 @@ def load_custom_css():
             margin-bottom: 20px;
         }
         .stButton button { height: 44px; }
+        /* Next 按鈕紅色，Retry 按鈕藍色 */
+        div[data-testid="column"] button { width: 100%; }
     </style>
     """, unsafe_allow_html=True)
 
-# --- ☁️ Google Sheets 核心 (單一頁面版) ---
+# --- ☁️ Google Sheets 核心 ---
 
 def get_db_connection():
     return st.connection("gsheets", type=GSheetsConnection)
 
 def load_data():
-    """強制讀取第一頁 (Sheet1)"""
     conn = get_db_connection()
     try:
-        # 不指定 worksheet，預設就是抓第一頁 (index 0)
-        df = conn.read(ttl=0)
-        # 確保必要的欄位存在，如果沒有就補上
+        df = conn.read(worksheet=SHEET_NAME, ttl=0)
         expected_cols = ["Question", "Weak_Question", "Fluency", "Vocabulary", "Grammar", "Clarity"]
-        for col in expected_cols:
-            if col not in df.columns:
-                df[col] = None # 補空欄位
+        if df.empty:
+            df = pd.DataFrame(columns=expected_cols)
+        else:
+            for col in expected_cols:
+                if col not in df.columns:
+                    df[col] = None
         return df
     except Exception as e:
-        st.error(f"Error loading Sheet1: {e}")
+        st.error(f"讀取錯誤: {e}")
         return pd.DataFrame()
 
 def update_question_data(question, scores):
-    """更新該題目的分數與 Weak 狀態"""
     conn = get_db_connection()
     try:
-        df = conn.read(ttl=0)
-        
-        # 確保 Question 欄位是字串
+        df = conn.read(worksheet=SHEET_NAME, ttl=0)
         df["Question"] = df["Question"].astype(str)
         
-        # 1. 計算平均分決定是否為 Weak (平均小於 6 分)
         avg_score = sum(scores.values()) / 4
         is_weak = "Yes" if avg_score < 6.0 else "No"
         
-        # 2. 找到該題目的位置 (Index)
-        # 這裡會回傳一個 True/False 的列表
         mask = df["Question"] == question
         
         if mask.any():
-            # 如果題目已存在，直接更新那一行
             idx = df[mask].index[0]
             df.at[idx, "Weak_Question"] = is_weak
             df.at[idx, "Fluency"] = scores["Fluency"]
@@ -94,7 +91,6 @@ def update_question_data(question, scores):
             df.at[idx, "Grammar"] = scores["Grammar"]
             df.at[idx, "Clarity"] = scores["Clarity"]
         else:
-            # 如果題目不存在(極少見)，新增一行
             new_row = pd.DataFrame([{
                 "Question": question,
                 "Weak_Question": is_weak,
@@ -105,17 +101,14 @@ def update_question_data(question, scores):
             }])
             df = pd.concat([df, new_row], ignore_index=True)
         
-        # 3. 寫回 Google Sheet
-        conn.update(data=df)
-        
-        # 顯示儲存成功訊息
+        conn.update(worksheet=SHEET_NAME, data=df)
         msg = "Saved! " + ("(Marked as Weak 🚩)" if is_weak == "Yes" else "(Good Job! ✅)")
         st.toast(msg, icon="💾")
         
     except Exception as e:
-        st.error(f"Save Error: {e}")
+        st.error(f"寫入錯誤: {e}")
 
-# --- 其他輔助函式 ---
+# --- 其他功能 ---
 
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
@@ -128,8 +121,19 @@ def transcribe_audio(audio_bytes):
 def get_ai_feedback(api_key, question, user_text):
     try:
         client = Groq(api_key=api_key)
-        # ... (保持原本的 Prompt)
-        system_prompt = "Act as an English tutor. Evaluate Clarity based on coherence."
+        system_prompt = """
+        Act as a strict but helpful English tutor.
+        First, CHECK RELEVANCE: Is the User Answer related to the Topic?
+        
+        IF OFF-TOPIC:
+        Set all scores to 0. 
+        Start feedback with "⚠️ **OFF-TOPIC WARNING**".
+        
+        IF RELEVANT:
+        Evaluate normally based on IELTS speaking criteria.
+        Noted that IELTS is a informal speaking test, so minor grammar slips are acceptable.
+        """
+        
         user_prompt = f"""
         Topic: "{question}"
         User Answer: "{user_text}"
@@ -142,7 +146,7 @@ def get_ai_feedback(api_key, question, user_text):
         Clarity: <0-10>
         [/SCORES]
         ### 📝 Feedback
-        (Bullet points)
+        (Bullet points. If off-topic, explain why.)
         ### 💡 Better Expression
         (Refined sentence)
         ### 🔧 Advice
@@ -180,17 +184,32 @@ async def generate_audio_bytes(text):
     await communicate.save(temp)
     with open(temp, "rb") as f: return f.read()
 
-def skip_topic_callback():
+# --- 🔄 按鈕回調函式 (重點) ---
+
+# 重置錄音機的 Key，強制 UI 重新載入錄音元件
+def reset_mic():
+    st.session_state.mic_key = st.session_state.get("mic_key", 0) + 1
+
+def next_question_callback():
     if st.session_state.questions_list:
         st.session_state.current_question = random.choice(st.session_state.questions_list)
         st.session_state.transcript = ""
         st.session_state.feedback = ""
         st.session_state.tts_audio_bytes = None
         st.session_state.scratchpad = ""
+        reset_mic() # 換題時也要重置錄音機
+
+def retry_question_callback():
+    """只清除結果，保留原本題目"""
+    st.session_state.transcript = ""
+    st.session_state.feedback = ""
+    st.session_state.tts_audio_bytes = None
+    # 不清除 scratchpad (可能想保留筆記)
+    reset_mic() # 關鍵：重置錄音機，這樣舊的音檔才不會殘留
 
 # --- 主程式 ---
 
-st.set_page_config(page_title="Speaking Tutor (Single Sheet)", page_icon="☁️", layout="centered")
+st.set_page_config(page_title="Speaking Tutor", page_icon="☁️", layout="centered")
 load_custom_css()
 
 # Initialization
@@ -199,15 +218,14 @@ if "current_question" not in st.session_state: st.session_state.current_question
 if "transcript" not in st.session_state: st.session_state.transcript = ""
 if "feedback" not in st.session_state: st.session_state.feedback = ""
 if "tts_audio_bytes" not in st.session_state: st.session_state.tts_audio_bytes = None
-# 用來暫存舊分數以便比較
-if "old_scores" not in st.session_state: st.session_state.old_scores = None 
+if "old_scores" not in st.session_state: st.session_state.old_scores = None
+if "mic_key" not in st.session_state: st.session_state.mic_key = 0 # 錄音機的唯一 ID
 
 with st.sidebar:
     st.title("Settings")
     api_key_input = st.text_input("🔑 Groq API Key", value=DEFAULT_API_KEY, type="password")
     st.divider()
     
-    # 讀取資料
     df = load_data()
     
     col1, col2 = st.columns(2)
@@ -216,26 +234,26 @@ with st.sidebar:
             if not df.empty:
                 st.session_state.questions_list = df['Question'].dropna().astype(str).tolist()
                 st.session_state.mode = "All Questions"
-                skip_topic_callback()
+                next_question_callback()
                 st.rerun()
+            else:
+                st.error(f"Sheet '{SHEET_NAME}' is empty.")
                 
     with col2:
         if st.button("☁️ Weak Only"):
-            if not df.empty:
-                # 篩選 Weak_Question == "Yes" (忽略大小寫)
-                if "Weak_Question" in df.columns:
-                    weak_df = df[df["Weak_Question"].astype(str).str.lower() == "yes"]
-                    questions = weak_df["Question"].dropna().astype(str).tolist()
-                    
-                    if questions:
-                        st.session_state.questions_list = questions
-                        st.session_state.mode = "Weak Review"
-                        skip_topic_callback()
-                        st.rerun()
-                    else:
-                        st.warning("No weak questions found!")
+            if not df.empty and "Weak_Question" in df.columns:
+                weak_df = df[df["Weak_Question"].astype(str).str.lower() == "yes"]
+                questions = weak_df["Question"].dropna().astype(str).tolist()
+                
+                if questions:
+                    st.session_state.questions_list = questions
+                    st.session_state.mode = "Weak Review"
+                    next_question_callback()
+                    st.rerun()
                 else:
-                    st.error("No 'Weak_Question' column.")
+                    st.warning("No weak questions!")
+            else:
+                st.warning("No data.")
 
     st.caption(f"Mode: {st.session_state.get('mode', 'Wait')}")
 
@@ -250,53 +268,69 @@ st.markdown(f"""
 """, unsafe_allow_html=True)
 
 # Scratchpad
-st.text_area("Scratchpad", height=68, key="scratchpad", label_visibility="collapsed", placeholder="Notes...")
+st.text_area("Scratchpad", height=68, key="scratchpad", label_visibility="collapsed", placeholder="Write notes here...")
 
-# Buttons
-c1, c2 = st.columns([1, 2], vertical_alignment="center")
-with c1: st.button("🎲 Skip", use_container_width=True, on_click=skip_topic_callback)
-with c2: audio_blob = mic_recorder(start_prompt="🔴 Record", stop_prompt="⏹️ Stop", key='recorder', format="wav")
+# Buttons Layout (Retry / Next / Record)
+c1, c2, c3 = st.columns([1, 1, 2], vertical_alignment="center")
+
+with c1: 
+    # 🔄 Retry 按鈕：清空結果，保留題目
+    st.button("🔄 Retry", use_container_width=True, on_click=retry_question_callback)
+    
+with c2: 
+    # ➡ Next 按鈕：換新題目
+    st.button("➡ Next", type="primary", use_container_width=True, on_click=next_question_callback)
+    
+with c3: 
+    # 錄音按鈕 (注意 key 是變動的，確保重置)
+    audio_blob = mic_recorder(
+        start_prompt="🔴 Record", 
+        stop_prompt="⏹️ Stop", 
+        key=f'recorder_{st.session_state.mic_key}', # 每次重置 key 就會變，強制重新載入
+        format="wav"
+    )
 
 # Logic
 if audio_blob:
-    st.audio(audio_blob['bytes'], format='audio/wav')
-    with st.spinner("Analyzing & Saving to Sheet..."):
-        transcript = transcribe_audio(audio_blob['bytes'])
-        if transcript:
-            st.session_state.transcript = transcript
-            if api_key_input:
-                # 1. 在更新之前，先抓舊分數 (為了顯示進步幅度)
-                try:
-                    current_q = st.session_state.current_question
-                    row = df[df["Question"] == current_q]
-                    if not row.empty:
-                        st.session_state.old_scores = {
-                            "Fluency": float(row.iloc[0].get("Fluency") or 0),
-                            "Vocabulary": float(row.iloc[0].get("Vocabulary") or 0),
-                            "Grammar": float(row.iloc[0].get("Grammar") or 0),
-                            "Clarity": float(row.iloc[0].get("Clarity") or 0),
-                        }
-                    else:
-                        st.session_state.old_scores = None
-                except:
-                    st.session_state.old_scores = None
+    if not st.session_state.transcript: 
+        st.audio(audio_blob['bytes'], format='audio/wav')
+        with st.spinner("Analyzing..."):
+            transcript = transcribe_audio(audio_blob['bytes'])
+            if transcript:
+                st.session_state.transcript = transcript
+                if api_key_input:
+                    # 抓取舊分數 (會抓到您剛剛才存進去的那個分數)
+                    try:
+                        current_q = st.session_state.current_question
+                        row = df[df["Question"] == current_q]
+                        if not row.empty:
+                            st.session_state.old_scores = {
+                                "Fluency": float(row.iloc[0].get("Fluency") or 0),
+                                "Vocabulary": float(row.iloc[0].get("Vocabulary") or 0),
+                                "Grammar": float(row.iloc[0].get("Grammar") or 0),
+                                "Clarity": float(row.iloc[0].get("Clarity") or 0),
+                            }
+                        else: st.session_state.old_scores = None
+                    except: st.session_state.old_scores = None
 
-                # 2. 取得 AI 回饋
-                feedback = get_ai_feedback(api_key_input, st.session_state.current_question, transcript)
-                st.session_state.feedback = feedback
-                
-                parsed = parse_feedback_robust(feedback)
-                scores = parsed["scores"]
-                
-                # 3. 更新 Google Sheet (覆蓋寫入)
-                update_question_data(st.session_state.current_question, scores)
-                
-                # 4. 生成 TTS
-                clean_better = parsed["better_expression"].replace("*", "").strip()
-                if len(clean_better) > 5:
-                    st.session_state.tts_audio_bytes = asyncio.run(generate_audio_bytes(clean_better))
-            else:
-                st.error("No API Key")
+                    # AI 分析
+                    feedback = get_ai_feedback(api_key_input, st.session_state.current_question, transcript)
+                    st.session_state.feedback = feedback
+                    
+                    parsed = parse_feedback_robust(feedback)
+                    scores = parsed["scores"]
+                    
+                    # 存入資料庫 (覆蓋舊分數)
+                    update_question_data(st.session_state.current_question, scores)
+                    
+                    # TTS
+                    clean_better = parsed["better_expression"].replace("*", "").strip()
+                    if len(clean_better) > 5:
+                        st.session_state.tts_audio_bytes = asyncio.run(generate_audio_bytes(clean_better))
+                else:
+                    st.error("No API Key")
+    else:
+        st.info("Results for current recording (Click 'Retry' to try again)")
 
 # Display Results
 if st.session_state.transcript:
@@ -309,9 +343,12 @@ if st.session_state.feedback:
     old = st.session_state.old_scores
     
     st.subheader("📊 Results")
-    m1, m2, m3, m4 = st.columns(4)
     
-    # 計算進步幅度 (這次分數 - 舊分數)
+    if scores['Fluency'] == 0 and scores['Vocabulary'] == 0:
+        st.error("⚠️ **Off-topic Warning**: Your answer seems unrelated to the topic.")
+    
+    m1, m2, m3, m4 = st.columns(4)
+    # 這裡的 old 就會是您上一輪的分數，所以可以看到進步幅度 (綠色數字)
     d_fl = scores["Fluency"] - old["Fluency"] if old else None
     d_vo = scores["Vocabulary"] - old["Vocabulary"] if old else None
     d_gr = scores["Grammar"] - old["Grammar"] if old else None
