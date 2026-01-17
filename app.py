@@ -151,9 +151,9 @@ def get_ai_feedback(api_key, question, user_text):
         ### 📝 Feedback
         (Bullet points. If off-topic, explain why.)
         ### 💡 Better Expression
-        (Refined sentence)
+        (Refined sentence from User Answer, with improvements marked with *asterisks*.)
         ### 🔧 Advice
-        (Template)
+        (Give a useful template sentence for this type of question.)
         """
         completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
