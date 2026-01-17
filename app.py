@@ -7,12 +7,13 @@ import asyncio
 import os
 import random
 import pandas as pd
-from groq import Groq # 👈 改用 Groq
+from groq import Groq
 import re
 
 # --- 設定區 ---
 DEFAULT_API_KEY = "" 
 EXCEL_FILE = "Questions.xlsx"
+WEAK_FILE = "Weak_Questions.csv" # 錯題本檔案
 
 # --- 💅 CSS 美化樣式 ---
 def load_custom_css():
@@ -50,38 +51,66 @@ def load_custom_css():
 
 # --- 核心功能函式 ---
 
-def load_questions_from_excel(file_path):
+def load_questions(source="excel"):
+    """讀取題目：可以是 Excel 或 錯題本 CSV"""
+    file_path = EXCEL_FILE if source == "excel" else WEAK_FILE
     try:
-        df = pd.read_excel(file_path)
-        if 'Question' in df.columns:
-            return df['Question'].dropna().astype(str).tolist()
+        if source == "excel":
+            df = pd.read_excel(file_path)
+            col_name = 'Question'
+        else:
+            # 如果錯題本不存在，回傳空清單
+            if not os.path.exists(file_path):
+                return []
+            df = pd.read_csv(file_path)
+            col_name = 'Question'
+            
+        if col_name in df.columns:
+            return df[col_name].dropna().astype(str).tolist()
         return []
     except:
         return []
+
+def save_weak_question(question):
+    """將低分題目存入 CSV"""
+    if not os.path.exists(WEAK_FILE):
+        df = pd.DataFrame({"Question": [question]})
+        df.to_csv(WEAK_FILE, index=False)
+    else:
+        df = pd.read_csv(WEAK_FILE)
+        if question not in df['Question'].values:
+            new_row = pd.DataFrame({"Question": [question]})
+            df = pd.concat([df, new_row], ignore_index=True)
+            df.to_csv(WEAK_FILE, index=False)
 
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
     try:
         with sr.AudioFile(BytesIO(audio_bytes)) as source:
             audio_data = r.record(source)
+            # Google 的辨識結果通常沒有標點，但沒關係，LLM 看得懂
             text = r.recognize_google(audio_data, language='en-US')
             return text
     except:
         return None
 
-# 👇 [重點修改] 這裡改成呼叫 Groq API
 def get_ai_feedback(api_key, question, user_text):
     try:
         client = Groq(api_key=api_key)
         
-        # System Prompt: 設定 AI 的角色
+        # [修改 1] System Prompt: 角色改為友善家教，而非嚴格考官
         system_prompt = """
-        Act as a strict IELTS speaking examiner.
-        Evaluate the user's answer based on 4 criteria (0-100).
-        Provide feedback in the exact requested format.
+        Act as a helpful, supportive English speaking tutor. 
+        The user is practicing for casual conversation or IELTS Speaking Part 1.
+        
+        Your Goals:
+        1. Rate leniently. Focus on communication intelligibility rather than perfection.
+        2. In "Better Expression", DO NOT rewrite the whole paragraph or change the meaning. 
+           Keep the user's original vocabulary level and sentence structure as much as possible.
+           Just fix grammar errors and make it flow slightly more naturally.
         """
 
-        # User Prompt: 傳入題目與回答
+        # [修改 2] User Prompt: 調整指令
         user_prompt = f"""
         Topic: "{question}"
         User Answer: "{user_text}"
@@ -89,29 +118,29 @@ def get_ai_feedback(api_key, question, user_text):
         Please output the response in this exact format:
         
         [SCORES]
-        Fluency: <score>
-        Vocabulary: <score>
-        Grammar: <score>
-        Pronunciation: <score>
+        Fluency: <score 0-10>
+        Vocabulary: <score 0-10>
+        Grammar: <score 0-10>
+        Pronunciation: <score 0-10>
         [/SCORES]
 
-        ### 📝 Detailed Feedback
-        (Provide bullet points for each criteria here)
+        ### 📝 Feedback
+        (Give 2-3 brief, encouraging bullet points on what was good and what to fix)
 
         ### 💡 Better Expression
-        (One perfect native sentence)
+        (Modify the user's sentence MINIMALLY. Just fix grammar/prepositions. Add punctuation.)
 
         ### 🔧 Advice (Traditional Chinese)
-        (One key tip)
+        (One simple, actionable tip for next time)
         """
 
         completion = client.chat.completions.create(
-            model="llama-3.3-70b-versatile", # 👈 使用 Groq 上強大的 Llama 3.3 模型
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt}
             ],
-            temperature=0.3, # 降低隨機性，讓格式更穩定
+            temperature=0.3,
             max_tokens=1024
         )
         
@@ -123,11 +152,11 @@ def get_ai_feedback(api_key, question, user_text):
 def parse_scores(text):
     scores = {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Pronunciation": 0}
     try:
-        pattern = r"(\w+):\s*(\d+)"
+        pattern = r"(\w+):\s*(\d+(\.\d+)?)" # 支援小數點
         matches = re.findall(pattern, text)
-        for key, value in matches:
+        for key, value, _ in matches:
             if key in scores:
-                scores[key] = int(value)
+                scores[key] = float(value)
     except:
         pass
     return scores
@@ -143,24 +172,41 @@ def play_tts(text):
 
 # --- 頁面主程式 ---
 
-st.set_page_config(page_title="Speaking Pro (Groq)", page_icon="⚡", layout="centered")
+st.set_page_config(page_title="Speaking Pro (Tutor Mode)", page_icon="⚡", layout="centered")
 load_custom_css()
 
 # Sidebar
 with st.sidebar:
     st.image("https://cdn-icons-png.flaticon.com/512/4712/4712009.png", width=80)
     st.title("Settings")
-    # 提示使用者輸入 Groq Key
-    api_key_input = st.text_input("🔑 Groq API Key", value=DEFAULT_API_KEY, type="password", help="Get it from console.groq.com")
+    api_key_input = st.text_input("🔑 Groq API Key", value=DEFAULT_API_KEY, type="password")
     
     st.divider()
-    if st.button("📂 Reload Excel Question"):
-        st.session_state.questions_list = load_questions_from_excel(EXCEL_FILE)
-        st.rerun()
+    st.write("📚 **Question Source**")
+    
+    # [修改 3] 錯題本與題庫切換功能
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        if st.button("📂 Normal"):
+            st.session_state.questions_list = load_questions("excel")
+            st.session_state.mode = "Normal"
+            st.rerun()
+    with col_s2:
+        if st.button("❤️ Weak Qs"):
+            qs = load_questions("weak")
+            if not qs:
+                st.toast("No weak questions saved yet!", icon="⚠️")
+            else:
+                st.session_state.questions_list = qs
+                st.session_state.mode = "Weak Review"
+                st.rerun()
+
+    current_mode = st.session_state.get("mode", "Normal")
+    st.caption(f"Current Mode: {current_mode}")
 
 # 初始化
 if "questions_list" not in st.session_state:
-    st.session_state.questions_list = load_questions_from_excel(EXCEL_FILE)
+    st.session_state.questions_list = load_questions("excel")
 if "current_question" not in st.session_state:
     st.session_state.current_question = random.choice(st.session_state.questions_list) if st.session_state.questions_list else "No Question"
 if "transcript" not in st.session_state:
@@ -170,13 +216,13 @@ if "feedback" not in st.session_state:
 
 # --- UI 佈局 ---
 
-st.title("⚡ AI Speaking Coach")
-st.markdown("Powered by **Groq Llama-3** for ultra-fast feedback.")
+st.title("⚡ AI Speaking Tutor")
+st.markdown("Practice comfortably. I'll fix your grammar gently.")
 
 # 1. 題目卡片
 st.markdown(f"""
 <div class="question-card">
-    <div style="color: #666; font-size: 14px; margin-bottom: 5px;">CURRENT TOPIC</div>
+    <div style="color: #666; font-size: 14px; margin-bottom: 5px;">CURRENT TOPIC ({st.session_state.get('mode', 'Normal')})</div>
     <div class="question-text">{st.session_state.current_question}</div>
 </div>
 """, unsafe_allow_html=True)
@@ -186,13 +232,13 @@ col1, col2, col3 = st.columns([1, 2, 1], vertical_alignment="center")
 
 with col1:
     if st.button("🎲 Skip Topic", use_container_width=True):
-        st.session_state.current_question = random.choice(st.session_state.questions_list)
-        st.session_state.transcript = ""
-        st.session_state.feedback = ""
-        st.rerun()
+        if st.session_state.questions_list:
+            st.session_state.current_question = random.choice(st.session_state.questions_list)
+            st.session_state.transcript = ""
+            st.session_state.feedback = ""
+            st.rerun()
 
 with col2:
-    # 這裡保留了 format="wav" 的修正，確保錄音正常
     audio_blob = mic_recorder(start_prompt="🔴 Record", stop_prompt="⏹️ Stop", key='recorder', format="wav")
 
 with col3:
@@ -200,7 +246,10 @@ with col3:
 
 # 3. 處理與顯示
 if audio_blob:
-    with st.spinner("⚡ Thinking at light speed..."): # 改了提示文字，強調 Groq 的速度
+    # [修改 4] 顯示錄音回放
+    st.audio(audio_blob['bytes'], format='audio/wav')
+    
+    with st.spinner("⚡ Tutor is listening..."):
         transcript = transcribe_audio(audio_blob['bytes'])
         if transcript:
             st.session_state.transcript = transcript
@@ -226,6 +275,12 @@ if st.session_state.transcript:
 if st.session_state.feedback:
     scores = parse_scores(st.session_state.feedback)
     
+    # [修改 5] 自動儲存低分題目邏輯
+    avg_score = sum(scores.values()) / 4 if scores else 0
+    if avg_score > 0 and avg_score < 6.0: # 如果平均分低於 6 分
+        save_weak_question(st.session_state.current_question)
+        st.toast(f"Low score ({avg_score}). Saved to Weak Questions! ❤️", icon="💾")
+    
     st.subheader("📊 Performance Score")
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Fluency", f"{scores.get('Fluency', '-')}", border=True)
@@ -235,20 +290,18 @@ if st.session_state.feedback:
 
     st.markdown("---")
     
-    tab1, tab2, tab3 = st.tabs(["📝 Detailed Feedback", "💡 Better Expression", "🔧 Advice (中文)"])
+    tab1, tab2, tab3 = st.tabs(["📝 Feedback", "💡 Better Expression", "🔧 Advice (中文)"])
     
     raw_text = st.session_state.feedback
     
-    # 簡單的解析容錯
     try:
-        detailed_part = raw_text.split("### 📝 Detailed Feedback")[1].split("### 💡 Better Expression")[0]
+        detailed_part = raw_text.split("### 📝 Feedback")[1].split("### 💡 Better Expression")[0]
         better_part = raw_text.split("### 💡 Better Expression")[1].split("### 🔧 Advice")[0]
         advice_part = raw_text.split("### 🔧 Advice (Traditional Chinese)")[1]
     except:
-        # 如果 Llama 輸出的格式稍微跑掉，就直接顯示原始全文，避免報錯
         detailed_part = raw_text
-        better_part = "Content format parsing failed, please check detailed feedback tab."
-        advice_part = "Please check detailed feedback tab."
+        better_part = "Parsing error"
+        advice_part = "Check details."
 
     with tab1:
         st.markdown(detailed_part)
@@ -256,9 +309,8 @@ if st.session_state.feedback:
     with tab2:
         st.success(better_part)
         clean_better = better_part.replace("*", "").strip()
-        # 避免 TTS 讀到奇怪的錯誤訊息
         if len(clean_better) > 5 and "Parsing error" not in clean_better:
-            if st.button("🔊 Listen to Native Version"):
+            if st.button("🔊 Listen to Fix"):
                 play_tts(clean_better)
             
     with tab3:
