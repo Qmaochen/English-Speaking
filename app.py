@@ -9,11 +9,14 @@ import random
 import pandas as pd
 from groq import Groq
 import re
+import json
+from datetime import datetime
 
 # --- 設定區 ---
 DEFAULT_API_KEY = "" 
 EXCEL_FILE = "Questions.xlsx"
-WEAK_FILE = "Weak_Questions.csv" # 錯題本檔案
+WEAK_FILE = "Weak_Questions.csv"
+HISTORY_FILE = "score_history.json" # [新增] 歷史紀錄檔
 
 # --- 💅 CSS 美化樣式 ---
 def load_custom_css():
@@ -52,16 +55,13 @@ def load_custom_css():
 # --- 核心功能函式 ---
 
 def load_questions(source="excel"):
-    """讀取題目：可以是 Excel 或 錯題本 CSV"""
     file_path = EXCEL_FILE if source == "excel" else WEAK_FILE
     try:
         if source == "excel":
             df = pd.read_excel(file_path)
             col_name = 'Question'
         else:
-            # 如果錯題本不存在，回傳空清單
-            if not os.path.exists(file_path):
-                return []
+            if not os.path.exists(file_path): return []
             df = pd.read_csv(file_path)
             col_name = 'Question'
             
@@ -72,7 +72,6 @@ def load_questions(source="excel"):
         return []
 
 def save_weak_question(question):
-    """將低分題目存入 CSV"""
     if not os.path.exists(WEAK_FILE):
         df = pd.DataFrame({"Question": [question]})
         df.to_csv(WEAK_FILE, index=False)
@@ -83,12 +82,52 @@ def save_weak_question(question):
             df = pd.concat([df, new_row], ignore_index=True)
             df.to_csv(WEAK_FILE, index=False)
 
+# [新增] 儲存分數歷史
+def save_score_history(question, scores):
+    history = {}
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                history = json.load(f)
+        except:
+            pass # 檔案損壞或空的，就重新建立
+    
+    if question not in history:
+        history[question] = []
+    
+    # 加入時間戳記
+    record = {
+        "date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+        "scores": scores
+    }
+    history[question].append(record)
+    
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=4)
+
+# [新增] 取得上一次的分數
+def get_previous_scores(question):
+    if not os.path.exists(HISTORY_FILE):
+        return None
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            history = json.load(f)
+        
+        records = history.get(question, [])
+        # 如果只有一筆紀錄(就是剛剛存的那筆)，代表沒有"上一次"，回傳 None
+        # 如果有兩筆以上，回傳倒數第二筆 (因為倒數第一筆是剛剛存的)
+        if len(records) >= 2:
+            return records[-2]["scores"]
+        else:
+            return None
+    except:
+        return None
+
 def transcribe_audio(audio_bytes):
     r = sr.Recognizer()
     try:
         with sr.AudioFile(BytesIO(audio_bytes)) as source:
             audio_data = r.record(source)
-            # Google 的辨識結果通常沒有標點，但沒關係，LLM 看得懂
             text = r.recognize_google(audio_data, language='en-US')
             return text
     except:
@@ -98,23 +137,19 @@ def get_ai_feedback(api_key, question, user_text):
     try:
         client = Groq(api_key=api_key)
         
-        # [修改 1] System Prompt: 角色改為友善家教，而非嚴格考官
+        # System Prompt
         system_prompt = """
         Act as a helpful, supportive English speaking tutor. 
-        The user is practicing for casual conversation or IELTS Speaking Part 1.
-        
         IMPORTANT: You cannot hear the audio. You can only see the transcript.
-        Therefore, instead of "Pronunciation", evaluate "Clarity". 
-        
-        If the transcript is perfectly coherent, give a high Clarity score (it means the speech-to-text engine understood the user well).
-        If the transcript has nonsense words or phonetic mix-ups (e.g., "sheep" instead of "ship"), lower the Clarity score.
+        Evaluate "Clarity" based on how coherent the transcript is.
         
         Your Goals:
         1. Rate leniently. Focus on communication intelligibility.
         2. In "Better Expression", DO NOT rewrite the whole paragraph. Keep the user's style. Just fix grammar.
+        3. In "Advice", provide a SENTENCE TEMPLATE (Pattern).
         """
 
-        # [修改 2] User Prompt: 調整指令
+        # User Prompt: [修改 Advice 部分]
         user_prompt = f"""
         Topic: "{question}"
         User Answer: "{user_text}"
@@ -129,13 +164,13 @@ def get_ai_feedback(api_key, question, user_text):
         [/SCORES]
 
         ### 📝 Feedback
-        (Give 2-3 brief, encouraging bullet points. If text looks wrong, ask if they meant a different word.)
+        (Give 2-3 brief, encouraging bullet points.)
 
         ### 💡 Better Expression
-        (Modify the user's sentence MINIMALLY. Just fix grammar/prepositions. Add punctuation.)
+        (Modify the user's sentence MINIMALLY. Just fix grammar. Add punctuation.)
 
-        ### 🔧 Advice (Traditional Chinese)
-        (One simple, actionable tip for next time)
+        ### 🔧 Advice (Template)
+        (Provide a useful English sentence template/structure that the user can use to answer this question better next time. e.g., "One main advantage of X is that...")
         """
 
         completion = client.chat.completions.create(
@@ -153,17 +188,48 @@ def get_ai_feedback(api_key, question, user_text):
     except Exception as e:
         return f"⚠️ Groq API Error: {e}"
 
-def parse_scores(text):
-    scores = {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Clarity": 0}
+# [修改] 更強壯的解析函式 (解決 Parsing Error)
+def parse_feedback_robust(text):
+    result = {
+        "scores": {"Fluency": 0, "Vocabulary": 0, "Grammar": 0, "Clarity": 0},
+        "feedback": "No feedback found.",
+        "better_expression": "No better expression found.",
+        "advice": "No advice found."
+    }
+    
+    # 1. 解析分數
     try:
-        pattern = r"(\w+):\s*(\d+(\.\d+)?)" # 支援小數點
+        pattern = r"(\w+):\s*(\d+(\.\d+)?)"
         matches = re.findall(pattern, text)
         for key, value, _ in matches:
-            if key in scores:
-                scores[key] = float(value)
+            if key in result["scores"]:
+                result["scores"][key] = float(value)
     except:
         pass
-    return scores
+
+    # 2. 解析各區塊 (使用 Regex 比較保險，不怕換行符號跑掉)
+    # flag=re.DOTALL 讓 . 可以匹配換行符號
+    
+    # 抓 Feedback
+    fb_match = re.search(r"### 📝 Feedback\s*(.*?)\s*###", text, re.DOTALL)
+    if fb_match:
+        result["feedback"] = fb_match.group(1).strip()
+    
+    # 抓 Better Expression
+    be_match = re.search(r"### 💡 Better Expression\s*(.*?)\s*###", text, re.DOTALL)
+    if be_match:
+        result["better_expression"] = be_match.group(1).strip()
+        
+    # 抓 Advice (抓到最後)
+    ad_match = re.search(r"### 🔧 Advice.*?\)\s*(.*)", text, re.DOTALL)
+    if not ad_match:
+        # 備用方案：如果標題稍微不一樣
+        ad_match = re.search(r"### 🔧 Advice\s*(.*)", text, re.DOTALL)
+        
+    if ad_match:
+        result["advice"] = ad_match.group(1).strip()
+
+    return result
 
 async def _edge_tts_save(text, filename):
     communicate = edge_tts.Communicate(text, "en-US-AndrewNeural")
@@ -176,7 +242,7 @@ def play_tts(text):
 
 # --- 頁面主程式 ---
 
-st.set_page_config(page_title="Speaking Pro (Tutor Mode)", page_icon="⚡", layout="centered")
+st.set_page_config(page_title="Speaking Tutor Pro", page_icon="📈", layout="centered")
 load_custom_css()
 
 # Sidebar
@@ -186,9 +252,7 @@ with st.sidebar:
     api_key_input = st.text_input("🔑 Groq API Key", value=DEFAULT_API_KEY, type="password")
     
     st.divider()
-    st.write("📚 **Question Source**")
     
-    # [修改 3] 錯題本與題庫切換功能
     col_s1, col_s2 = st.columns(2)
     with col_s1:
         if st.button("📂 Normal"):
@@ -199,14 +263,13 @@ with st.sidebar:
         if st.button("❤️ Weak Qs"):
             qs = load_questions("weak")
             if not qs:
-                st.toast("No weak questions saved yet!", icon="⚠️")
+                st.toast("No weak questions yet!", icon="⚠️")
             else:
                 st.session_state.questions_list = qs
                 st.session_state.mode = "Weak Review"
                 st.rerun()
 
-    current_mode = st.session_state.get("mode", "Normal")
-    st.caption(f"Current Mode: {current_mode}")
+    st.caption(f"Current Mode: {st.session_state.get('mode', 'Normal')}")
 
 # 初始化
 if "questions_list" not in st.session_state:
@@ -218,12 +281,12 @@ if "transcript" not in st.session_state:
 if "feedback" not in st.session_state:
     st.session_state.feedback = ""
 
-# --- UI 佈局 ---
+# --- UI ---
 
-st.title("⚡ AI Speaking Tutor")
-st.markdown("Practice comfortably. I'll fix your grammar gently.")
+st.title("📈 AI Speaking Tutor")
+st.markdown("Practice, Track Progress, and Improve.")
 
-# 1. 題目卡片
+# 1. 題目
 st.markdown(f"""
 <div class="question-card">
     <div style="color: #666; font-size: 14px; margin-bottom: 5px;">CURRENT TOPIC ({st.session_state.get('mode', 'Normal')})</div>
@@ -231,7 +294,7 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# 2. 操作按鈕區
+# 2. 按鈕
 col1, col2, col3 = st.columns([1, 2, 1], vertical_alignment="center")
 
 with col1:
@@ -248,18 +311,22 @@ with col2:
 with col3:
     pass
 
-# 3. 處理與顯示
+# 3. 處理
 if audio_blob:
-    # [修改 4] 顯示錄音回放
-    st.audio(audio_blob['bytes'], format='audio/wav')
+    st.audio(audio_blob['bytes'], format='audio/wav') # 回放自己聲音
     
-    with st.spinner("⚡ Tutor is listening..."):
+    with st.spinner("⚡ Tutor is analyzing & saving history..."):
         transcript = transcribe_audio(audio_blob['bytes'])
         if transcript:
             st.session_state.transcript = transcript
             if api_key_input:
                 feedback = get_ai_feedback(api_key_input, st.session_state.current_question, transcript)
                 st.session_state.feedback = feedback
+                
+                # [新增] 儲存分數到歷史紀錄
+                parsed = parse_feedback_robust(feedback)
+                save_score_history(st.session_state.current_question, parsed["scores"])
+                
             else:
                 st.error("Please enter Groq API Key")
         else:
@@ -268,7 +335,6 @@ if audio_blob:
 # 4. 結果展示
 if st.session_state.transcript:
     st.divider()
-    
     st.markdown(f"""
     <div class="user-answer-box">
         <b>🗣️ You said:</b><br>
@@ -277,45 +343,52 @@ if st.session_state.transcript:
     """, unsafe_allow_html=True)
 
 if st.session_state.feedback:
-    scores = parse_scores(st.session_state.feedback)
+    # 使用新的 Robust 解析器
+    data = parse_feedback_robust(st.session_state.feedback)
+    scores = data["scores"]
     
-    # [修改 5] 自動儲存低分題目邏輯
+    # 錯題本邏輯
     avg_score = sum(scores.values()) / 4 if scores else 0
-    if avg_score > 0 and avg_score < 6.0: # 如果平均分低於 6 分
+    if avg_score > 0 and avg_score < 6.0:
         save_weak_question(st.session_state.current_question)
-        st.toast(f"Low score ({avg_score}). Saved to Weak Questions! ❤️", icon="💾")
+        st.toast(f"Low score ({avg_score:.1f}). Saved to Weak Questions!", icon="💾")
+
+    # [新增] 取得上一次分數並計算 Delta
+    prev_scores = get_previous_scores(st.session_state.current_question)
     
-    st.subheader("📊 Performance Score")
+    st.subheader("📊 Score & Progress")
+    if prev_scores:
+        st.caption("Comparing with your last attempt (Green = Improved)")
+    else:
+        st.caption("First time recording this question.")
+
     m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Fluency", f"{scores.get('Fluency', '-')}", border=True)
-    m2.metric("Vocab", f"{scores.get('Vocabulary', '-')}", border=True)
-    m3.metric("Grammar", f"{scores.get('Grammar', '-')}", border=True)
-    m4.metric("Clarity", f"{scores.get('Clarity', '-')}", border=True)
+    
+    # 計算 Delta (如果沒有上次分數，Delta 就是 None)
+    d_fluency = scores["Fluency"] - prev_scores["Fluency"] if prev_scores else None
+    d_vocab = scores["Vocabulary"] - prev_scores["Vocabulary"] if prev_scores else None
+    d_grammar = scores["Grammar"] - prev_scores["Grammar"] if prev_scores else None
+    d_clarity = scores["Clarity"] - prev_scores["Clarity"] if prev_scores else None
+
+    m1.metric("Fluency", f"{scores['Fluency']}", delta=d_fluency, border=True)
+    m2.metric("Vocab", f"{scores['Vocabulary']}", delta=d_vocab, border=True)
+    m3.metric("Grammar", f"{scores['Grammar']}", delta=d_grammar, border=True)
+    m4.metric("Clarity", f"{scores['Clarity']}", delta=d_clarity, border=True)
 
     st.markdown("---")
     
-    tab1, tab2, tab3 = st.tabs(["📝 Feedback", "💡 Better Expression", "🔧 Advice (中文)"])
-    
-    raw_text = st.session_state.feedback
-    
-    try:
-        detailed_part = raw_text.split("### 📝 Feedback")[1].split("### 💡 Better Expression")[0]
-        better_part = raw_text.split("### 💡 Better Expression")[1].split("### 🔧 Advice")[0]
-        advice_part = raw_text.split("### 🔧 Advice (Traditional Chinese)")[1]
-    except:
-        detailed_part = raw_text
-        better_part = "Parsing error"
-        advice_part = "Check details."
+    tab1, tab2, tab3 = st.tabs(["📝 Feedback", "💡 Better Expression", "🔧 Template"])
 
     with tab1:
-        st.markdown(detailed_part)
+        st.markdown(data["feedback"])
     
     with tab2:
-        st.success(better_part)
-        clean_better = better_part.replace("*", "").strip()
-        if len(clean_better) > 5 and "Parsing error" not in clean_better:
+        st.success(data["better_expression"])
+        clean_better = data["better_expression"].replace("*", "").strip()
+        if len(clean_better) > 5:
             if st.button("🔊 Listen to Fix"):
                 play_tts(clean_better)
             
     with tab3:
-        st.info(advice_part)
+        # 這裡會顯示英文的 Template
+        st.info(data["advice"])
