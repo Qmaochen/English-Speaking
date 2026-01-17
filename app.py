@@ -20,7 +20,8 @@ try:
         
         # 3. 嘗試連線
         conn = st.connection("gsheets", type=GSheetsConnection)
-        df = conn.read(worksheet="Questions")
+        # 加上 ttl=0 可以強迫它重新去雲端抓資料，不要讀舊紀錄
+        df = conn.read(worksheet="Questions", ttl=0)
         st.success("🎉 連線成功！讀取到資料了！")
         st.dataframe(df)
 
