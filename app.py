@@ -382,5 +382,7 @@ if st.session_state.feedback:
     with t1: st.markdown(data["feedback"])
     with t2: 
         st.success(data["better_expression"])
-        if st.session_state.tts_audio_bytes: st.audio(st.session_state.tts_audio_bytes, format="audio/mp3")
+        # 修正：將 format 改為 "audio/mpeg" 以支援 iPhone Safari
+        if st.session_state.tts_audio_bytes: 
+            st.audio(st.session_state.tts_audio_bytes, format="audio/mpeg")
     with t3: st.info(data["advice"])
